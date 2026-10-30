@@ -1,0 +1,102 @@
+name: 24/7 Live Hot-Reload & Watchdog Bot (@voiceandpasokhbot)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    # پشتیبان زمان‌بندی، در حالی که استارت اصلی بدون وقفه توسط گام Self Re-Trigger انجام می‌شود
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+# cancel-in-progress باید false باشد تا وقتی گام آخر سیکل بعدی را استارت می‌زند، سیکل فعلی وسط مراحل Post کنسل نشود
+concurrency:
+  group: voiceandpasokhbot-live-runner
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: 📥 دریافت مخزن کد (Checkout Repository)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 نصب پایتون (Set up Python)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 📦 نصب ابزارها و پیش‌نیازها (Install Dependencies)
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y psmisc lsof sqlite3 ffmpeg openssl
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: 🔐 بازیابی ایمن دیتابیس از کش گیت‌هاب (بدون انتشار عمومی در مخزن)
+        uses: actions/cache/restore@v4
+        with:
+          path: voice_bot.db.enc
+          key: voice-bot-db-${{ github.ref_name }}-
+          restore-keys: |
+            voice-bot-db-${{ github.ref_name }}-
+            voice-bot-db-
+
+      - name: 🔓 رمزگشایی دیتابیس در محیط ایزوله رانر
+        env:
+          CACHE_KEY_SECRET: ${{ secrets.BOT_TOKEN }}
+        run: |
+          if [ -f "voice_bot.db.enc" ]; then
+            test -n "$CACHE_KEY_SECRET" || { echo "BOT_TOKEN is required to decrypt the database"; exit 1; }
+            openssl enc -d -aes-256-cbc -pbkdf2 -in voice_bot.db.enc -out voice_bot.db -pass env:CACHE_KEY_SECRET || { rm -f voice_bot.db; exit 1; }
+          fi
+
+      - name: 🔥 اجرای ۲۴/۷ با مکانیزم ترکیبی Hot-Reload و Watchdog (ضد کرش و بدون افشای توکن)
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
+          PRIVATE_CHAT_ONLY: "true"
+          TRANSCRIBE_MODEL: "gemini-2.5-flash"
+          CHAT_MODEL: "gemini-2.5-flash"
+          DB_PATH: "voice_bot.db"
+        run: |
+          chmod +x run_workflow.sh
+          ./run_workflow.sh
+
+      - name: 🔒 رمزنگاری دیتابیس قبل از ذخیره در کش
+        if: ${{ always() }}
+        env:
+          CACHE_KEY_SECRET: ${{ secrets.BOT_TOKEN }}
+        run: |
+          if [ -f "voice_bot.db" ]; then
+            test -n "$CACHE_KEY_SECRET" || { echo "BOT_TOKEN is required to encrypt the database"; exit 1; }
+            sqlite3 voice_bot.db "PRAGMA wal_checkpoint(TRUNCATE);"
+            openssl enc -aes-256-cbc -salt -pbkdf2 -in voice_bot.db -out voice_bot.db.enc -pass env:CACHE_KEY_SECRET
+          fi
+
+      - name: 💾 ذخیره دیتابیس رمزنگاری‌شده در کش خصوصی اکشنز (بدون Commit در مخزن پابلیک)
+        if: ${{ always() && hashFiles('voice_bot.db.enc') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: voice_bot.db.enc
+          key: voice-bot-db-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 🔄 استارت خودکار سیکل بعدی بدون قطعی (Self Re-Trigger)
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🚀 در حال استارت آنی سیکل بعدی..."
+          BRANCH_NAME="${GITHUB_REF_NAME:-main}"
+          gh workflow run "main.yml" --ref "$BRANCH_NAME" || true
+          echo "✅ سیکل جدید با موفقیت استارت خورد!"
